@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Filester Album Workspace (Standalone Edition)
 // @namespace    https://github.com/ervss/filester-album-workspace
-// @version      2.0.0
-// @description  Standalone power-user workspace for Filester albums & file manager: multi-size grid, advanced search, direct metadata probing, in-page video player, multi-video split-screen, review tracking, bulk export & save-to-account. No external server required!
+// @version      2.1.0
+// @description  Standalone power-user workspace for Filester albums & file manager: multi-size grid, advanced search, direct metadata probing, in-page video player, multi-video split-screen, subfolders info, multi-page folder merging, review tracking, bulk export & save-to-account. No external server required!
 // @author       ervss (https://github.com/ervss)
 // @license      MIT
 // @homepageURL  https://github.com/ervss/filester-album-workspace
@@ -42,7 +42,7 @@
   'use strict';
 
   console.log(
-    '%c[Filester Workspace v2.0.0 by ervss]%c Loaded — Album & File Manager Ready (https://github.com/ervss/filester-album-workspace)',
+    '%c[Filester Workspace v2.1.0 by ervss]%c Loaded — Album & File Manager & Subfolders Ready (https://github.com/ervss/filester-album-workspace)',
     'color: #35d07f; font-weight: bold',
     'color: #aaa'
   );
@@ -66,6 +66,10 @@
   const STYLE_ID = `${PREFIX}-styles`;
   const PREF_KEY = `${PREFIX}:prefs:v2`;
   const META_KEY = `${PREFIX}:meta:v2`;
+  const FOLDER_META_KEY = `${PREFIX}:foldermeta:v2`;
+  const FOLDER_DOCK_ID = `${PREFIX}-folder-dock`;
+  const FOLDER_TOOLBAR_ID = `${PREFIX}-folder-toolbar`;
+  const MERGED_BANNER_ID = `${PREFIX}-merged-banner`;
   const META_CHUNK = 12;
   const STREAM_TTL_MS = 25 * 60 * 1000; // CDN tokens typically expire after ~30 mins
 
@@ -93,6 +97,20 @@
   let shortcutsModal = null;
   let lastSelectedIndex = -1;
   let currentPlayerIndex = -1;
+
+  // Subfolders & Merged album state
+  const folderMetadata = loadObject(FOLDER_META_KEY);
+  const selectedFolders = new Set();
+  let folderItems = [];
+  let isMergedMode = false;
+  let activeMergedFolderFilter = 'all';
+  let mergedFoldersInfo = [];
+  let originalFilesGridBackup = null;
+  let originalSubfoldersSectionDisplay = '';
+  let folderSearchTerm = '';
+  let folderSortMode = 'native';
+  let folderDock = null;
+  let subfolderObserver = null;
 
   const metadata = Object.assign(loadObject(`${LEGACY_PREFIX}:meta:v1`), loadObject(META_KEY));
   const state = Object.assign({
@@ -137,6 +155,8 @@
 
   function boot() {
     try {
+      initSubfolders();
+      checkMergedHashOnBoot();
       grid = findFileGrid();
       if (isManagerPage() && !grid) {
         if (!managerLoading) loadManagerGrid();
@@ -433,7 +453,9 @@
     const originalIndex = Number(el.dataset.nfwOriginalIndex);
     const meta = metadata[url] || {};
     const guessedHeight = guessHeight(title);
-    return { el, index: originalIndex, title, slug, url, thumb, sizeBytes, dateTs, type, meta, guessedHeight };
+    const folderSlug = el.dataset.folderSlug || '';
+    const folderName = el.dataset.folderName || '';
+    return { el, index: originalIndex, title, slug, url, thumb, sizeBytes, dateTs, type, meta, guessedHeight, folderSlug, folderName };
   }
 
   function toggleItemSelection(item, forceState, shiftKey = false) {
@@ -1188,6 +1210,10 @@
     const minSize = positiveNumber(state.minSize) * 1024 ** 2;
     const maxSize = positiveNumber(state.maxSize) * 1024 ** 2;
     return items.filter((item) => {
+      if (isMergedMode && activeMergedFolderFilter !== 'all') {
+        const itemSlug = item.folderSlug || item.el.dataset.folderSlug;
+        if (itemSlug && itemSlug !== activeMergedFolderFilter) return false;
+      }
       const haystack = item.title.toLowerCase();
       if (tokens.some((t) => t.negative ? haystack.includes(t.value) : !haystack.includes(t.value))) return false;
       if (!matchesQuality(item, state.quality)) return false;
@@ -2135,6 +2161,883 @@
     toastTimer = window.setTimeout(() => element.classList.remove('is-visible'), 4600);
   }
 
+  // --- Subfolders Discovery, Metadata & Virtual Merged Album ----------------
+  function initSubfolders() {
+    if (isManagerPage()) return;
+
+    // Unhide all folders: Filester natively hides items past 5
+    const unhideAllFolders = () => {
+      document.querySelectorAll('#subfoldersGrid .subfolder-item, .subfolders-grid .subfolder-item, .subfolders-grid a[href*="/f/"]').forEach((el) => {
+        el.style.removeProperty('display');
+        el.removeAttribute('hidden');
+      });
+      document.querySelectorAll('#showMoreFoldersBtn, .show-more-folders, [data-action="showMoreFolders"]').forEach((btn) => {
+        btn.style.display = 'none';
+      });
+    };
+    unhideAllFolders();
+
+    const subGrid = document.querySelector('#subfoldersGrid, .subfolders-grid');
+    if (!subGrid) return;
+
+    refreshSubfolders();
+
+    if (!subfolderObserver) {
+      try {
+        subfolderObserver = new MutationObserver(() => {
+          unhideAllFolders();
+          refreshSubfolders();
+        });
+        subfolderObserver.observe(subGrid, { childList: true });
+      } catch (_) {}
+    }
+  }
+
+  function refreshSubfolders() {
+    const subGrid = document.querySelector('#subfoldersGrid, .subfolders-grid');
+    if (!subGrid) return;
+
+    const cards = [...subGrid.querySelectorAll('.subfolder-item, a[href*="/f/"]')];
+    if (!cards.length) return;
+
+    folderItems = cards.map(readSubfolderCard).filter(Boolean);
+    for (const f of folderItems) {
+      injectSubfolderCardTools(f);
+    }
+
+    ensureSubfolderToolbar();
+    syncSubfolderToolbar();
+    syncFolderDock();
+    applyFolderFiltersAndSort();
+    fetchSubfoldersMetadata(folderItems);
+  }
+
+  function readSubfolderCard(el, index) {
+    const href = el.getAttribute('href') || '';
+    const slug = href.match(/\/f\/([A-Za-z0-9_-]+)/)?.[1] || '';
+    if (!slug) return null;
+    const title = (el.querySelector('.subfolder-name')?.textContent || '').trim();
+    const metaText = (el.querySelector('.subfolder-meta')?.textContent || '').trim();
+    const nativeFilesMatch = metaText.match(/(\d+)\s*files?/i);
+    const nativeFilesCount = nativeFilesMatch ? Number(nativeFilesMatch[1]) : 0;
+    const thumb = el.querySelector('.subfolder-thumb img')?.src || '';
+    const url = new URL(href, location.origin).href;
+    if (el.dataset.nfwFolderOriginalIndex == null) el.dataset.nfwFolderOriginalIndex = String(index);
+    const originalIndex = Number(el.dataset.nfwFolderOriginalIndex);
+    return { el, slug, title, nativeFilesCount, thumb, url, index: originalIndex };
+  }
+
+  function injectSubfolderCardTools(folder) {
+    const { el, slug, title, url } = folder;
+    el.classList.add('nfw-subfolder-card');
+
+    const thumbWrap = el.querySelector('.subfolder-thumb') || el;
+
+    // Checkbox wrap
+    let checkWrap = el.querySelector('.nfw-folder-check-wrap');
+    if (!checkWrap) {
+      checkWrap = document.createElement('label');
+      checkWrap.className = 'nfw-check-wrap nfw-folder-check-wrap';
+      checkWrap.title = 'Select folder for merge / bulk actions';
+      checkWrap.innerHTML = '<input class="nfw-check nfw-folder-check" type="checkbox"><span></span>';
+      stopCardClick(checkWrap);
+      thumbWrap.appendChild(checkWrap);
+
+      const checkbox = checkWrap.querySelector('input');
+      checkbox.addEventListener('change', () => {
+        checkbox.checked ? selectedFolders.add(slug) : selectedFolders.delete(slug);
+        el.classList.toggle('nfw-selected', checkbox.checked);
+        syncFolderDock();
+        syncSubfolderToolbar();
+      });
+    }
+    const checkbox = checkWrap.querySelector('input');
+    checkbox.checked = selectedFolders.has(slug);
+    el.classList.toggle('nfw-selected', checkbox.checked);
+
+    // Clicking thumb toggles selection
+    if (thumbWrap && !thumbWrap.dataset.nfwSelectBound) {
+      thumbWrap.dataset.nfwSelectBound = '1';
+      thumbWrap.classList.add('nfw-select-thumb');
+      thumbWrap.title = 'Click thumbnail to select folder (click title to open)';
+      thumbWrap.addEventListener('click', (event) => {
+        if (event.target.closest('.nfw-folder-check-wrap, .nfw-folder-open-btn')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        checkbox.checked = !checkbox.checked;
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+      }, true);
+    }
+
+    // Direct open button overlay
+    let openBtn = el.querySelector('.nfw-folder-open-btn');
+    if (!openBtn) {
+      openBtn = document.createElement('a');
+      openBtn.href = url;
+      openBtn.className = 'nfw-folder-open-btn';
+      openBtn.title = `Open folder "${title}"`;
+      openBtn.setAttribute('aria-label', `Open ${title}`);
+      openBtn.innerHTML = '↗';
+      stopCardClick(openBtn);
+      thumbWrap.appendChild(openBtn);
+    }
+
+    // Remove any duplicate thumbnail badge if present
+    el.querySelector('.nfw-folder-badge')?.remove();
+
+    // Rich meta line under thumb
+    let metaEl = el.querySelector('.nfw-folder-meta');
+    if (!metaEl) {
+      const nativeMeta = el.querySelector('.subfolder-meta');
+      metaEl = document.createElement('div');
+      metaEl.className = 'subfolder-meta nfw-folder-meta';
+      if (nativeMeta) {
+        nativeMeta.replaceWith(metaEl);
+      } else {
+        el.querySelector('.subfolder-info')?.appendChild(metaEl);
+      }
+    }
+
+    paintSubfolderCard(folder, metaEl);
+  }
+
+  function paintSubfolderCard(folder, metaEl) {
+    const meta = folderMetadata[folder.slug] || {};
+    const filesCount = Math.max(meta.filesCount || 0, folder.nativeFilesCount || 0);
+    const totalPages = Number(meta.totalPages || (filesCount > 24 ? Math.ceil(filesCount / 24) : 1));
+
+    const parts = [];
+    const pagesInfo = totalPages > 1 ? ` <span class="nfw-fmeta-pages">(${totalPages} pages)</span>` : '';
+    parts.push(`<span class="nfw-fmeta-item nfw-fmeta-files" title="${filesCount} files${totalPages > 1 ? ` across ${totalPages} pages` : ''}">📄 <strong>${filesCount}</strong> files${pagesInfo}</span>`);
+
+    if (meta.size) {
+      parts.push(`<span class="nfw-fmeta-item nfw-fmeta-size" title="Total size: ${meta.size}">💾 <strong>${escapeHtml(meta.size)}</strong></span>`);
+    } else {
+      parts.push(`<span class="nfw-fmeta-item nfw-fmeta-loading">💾 loading…</span>`);
+    }
+
+    if (meta.latestUpload) {
+      const dateTs = parseUploadTime(meta.latestUpload);
+      if (dateTs) {
+        const formatted = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(dateTs);
+        parts.push(`<span class="nfw-fmeta-item nfw-fmeta-date" title="Latest upload: ${formatted}">🕒 ${formatted}</span>`);
+      }
+    } else if (meta.created) {
+      parts.push(`<span class="nfw-fmeta-item nfw-fmeta-created" title="Created: ${escapeHtml(meta.created)}">📅 ${escapeHtml(meta.created)}</span>`);
+    }
+
+    metaEl.innerHTML = parts.join('');
+  }
+
+  async function fetchSubfoldersMetadata(folders, force = false) {
+    const queue = folders.filter((f) => force || !folderMetadata[f.slug]?.size || !folderMetadata[f.slug]?.totalPages);
+    if (!queue.length) return;
+
+    await mapWithLimit(queue, 3, async (folder) => {
+      try {
+        const resp = await fetch(folder.url, { credentials: 'same-origin' });
+        if (!resp.ok) return;
+        const html = await resp.text();
+
+        const sizeMatch = html.match(/Total size<\/span>\s*<span[^>]*>([^<]+)<\/span>/i) ||
+                          html.match(/<span class="tnum">([\d.]+\s*(?:B|KB|MB|GB|TB))<\/span>/i);
+        const size = sizeMatch ? sizeMatch[1].trim() : '';
+
+        const createdMatch = html.match(/Created\s+([A-Za-z]{3}\s+\d{1,2},\s+\d{4})/i) ||
+                             html.match(/Created<\/span>\s*<span>([^<]+)<\/span>/i);
+        const created = createdMatch ? createdMatch[1].trim() : '';
+
+        const dates = Array.from(html.matchAll(/data-date="([^"]+)"/g), (m) => m[1]).filter(Boolean).sort().reverse();
+        const latestUpload = dates[0] || '';
+
+        const types = Array.from(html.matchAll(/data-type="([^"]+)"/g), (m) => m[1]);
+        const filesMatch = html.match(/Files<\/span>\s*<span[^>]*class="tnum"[^>]*>(\d+)<\/span>/i) ||
+                           html.match(/<span class="tnum">(\d+)\s*files?<\/span>/i) ||
+                           html.match(/id="fileCountDisplay"[^>]*>\s*\((\d+)\)\s*<\/span>/i) ||
+                           html.match(/(\d+)\s*files/i);
+
+        const totalPagesMatch = html.match(/data-total="(\d+)"/i) ||
+                                html.match(/Page\s+\d+\s*\/\s*(\d+)/i) ||
+                                html.match(/(\d+)\s*pages?/i);
+
+        const parsedFiles = filesMatch ? Number(filesMatch[1]) : 0;
+        const filesCount = Math.max(parsedFiles, folder.nativeFilesCount || 0, types.length);
+        const totalPages = totalPagesMatch ? Number(totalPagesMatch[1]) : (filesCount > 24 ? Math.ceil(filesCount / 24) : 1);
+        const videoCount = types.filter((t) => t === 'videos').length;
+
+        folderMetadata[folder.slug] = {
+          size,
+          sizeBytes: parseSizeBytes(size),
+          created,
+          latestUpload,
+          filesCount,
+          totalPages,
+          videoCount,
+          ts: Date.now(),
+        };
+
+        const metaEl = folder.el.querySelector('.nfw-folder-meta');
+        if (metaEl) paintSubfolderCard(folder, metaEl);
+
+        persistFolderMetadata();
+        syncSubfolderToolbar();
+        syncFolderDock();
+      } catch (err) {
+        console.warn('[Filester Workspace] Folder meta fetch error:', folder.slug, err);
+      }
+    });
+  }
+
+  function persistFolderMetadata() {
+    try {
+      localStorage.setItem(FOLDER_META_KEY, JSON.stringify(trimMetadata(folderMetadata, 2000)));
+    } catch (_) {}
+  }
+
+  function ensureSubfolderToolbar() {
+    if (document.getElementById(FOLDER_TOOLBAR_ID)) return;
+    const subGrid = document.querySelector('#subfoldersGrid, .subfolders-grid');
+    if (!subGrid) return;
+
+    const toolbar = document.createElement('div');
+    toolbar.id = FOLDER_TOOLBAR_ID;
+    toolbar.className = 'nfw-folder-toolbar';
+    toolbar.innerHTML = `
+      <div class="nfw-ft-left">
+        <span class="nfw-ft-title">📁 Folders</span>
+        <label class="nfw-ft-search"><span>⌕</span><input type="text" data-role="folderSearch" placeholder="Filter folders…"></label>
+        <select data-role="folderSort" title="Sort folders">
+          <option value="native">Original order</option>
+          <option value="name_asc">Name A–Z</option>
+          <option value="name_desc">Name Z–A</option>
+          <option value="size_desc">Largest size ↓</option>
+          <option value="size_asc">Smallest size ↑</option>
+          <option value="files_desc">Most files ↓</option>
+          <option value="date_desc">Newest upload ↓</option>
+        </select>
+      </div>
+      <div class="nfw-ft-right">
+        <button type="button" data-action="selectAllFolders">Select All</button>
+        <button type="button" data-action="clearAllFolders">Clear Selection</button>
+        <button type="button" data-action="refreshFolderMeta" title="Re-check folder sizes and dates">↻ Refresh</button>
+        <span class="nfw-ft-stats" data-role="folderStats"></span>
+      </div>
+    `;
+
+    subGrid.parentElement.insertBefore(toolbar, subGrid);
+
+    const searchInput = toolbar.querySelector('[data-role="folderSearch"]');
+    searchInput.addEventListener('input', () => {
+      folderSearchTerm = searchInput.value.trim().toLowerCase();
+      applyFolderFiltersAndSort();
+    });
+
+    const sortSelect = toolbar.querySelector('[data-role="folderSort"]');
+    sortSelect.addEventListener('change', () => {
+      folderSortMode = sortSelect.value;
+      applyFolderFiltersAndSort();
+    });
+
+    toolbar.addEventListener('click', (event) => {
+      const btn = event.target.closest('button');
+      if (!btn) return;
+      const act = btn.dataset.action;
+      if (act === 'selectAllFolders') {
+        for (const f of folderItems) {
+          if (f.el.style.display !== 'none') selectedFolders.add(f.slug);
+        }
+        refreshSubfolders();
+      } else if (act === 'clearAllFolders') {
+        selectedFolders.clear();
+        refreshSubfolders();
+      } else if (act === 'refreshFolderMeta') {
+        fetchSubfoldersMetadata(folderItems, true);
+        toast('Refreshing folder information…');
+      }
+    });
+
+    syncSubfolderToolbar();
+  }
+
+  function syncSubfolderToolbar() {
+    const toolbar = document.getElementById(FOLDER_TOOLBAR_ID);
+    if (!toolbar) return;
+    const statsEl = toolbar.querySelector('[data-role="folderStats"]');
+    if (statsEl) {
+      let totalBytes = 0;
+      let totalFiles = 0;
+      for (const f of folderItems) {
+        const meta = folderMetadata[f.slug] || {};
+        totalBytes += Number(meta.sizeBytes || 0);
+        totalFiles += Number(meta.filesCount || f.nativeFilesCount || 0);
+      }
+      const sizeStr = totalBytes > 0 ? ` · ${formatBytes(totalBytes)}` : '';
+      statsEl.textContent = `${folderItems.length} folder${folderItems.length === 1 ? '' : 's'} · ${totalFiles} file${totalFiles === 1 ? '' : 's'}${sizeStr}`;
+    }
+  }
+
+  function applyFolderFiltersAndSort() {
+    const subGrid = document.querySelector('#subfoldersGrid, .subfolders-grid');
+    if (!subGrid) return;
+
+    for (const f of folderItems) {
+      const matches = !folderSearchTerm || f.title.toLowerCase().includes(folderSearchTerm);
+      f.el.style.display = matches ? 'flex' : 'none';
+    }
+
+    if (folderSortMode === 'native') return;
+
+    const copy = [...folderItems];
+    const getSizeBytes = (f) => Number(folderMetadata[f.slug]?.sizeBytes || 0);
+    const getFilesCount = (f) => Number(folderMetadata[f.slug]?.filesCount || f.nativeFilesCount || 0);
+    const getDateTs = (f) => parseUploadTime(folderMetadata[f.slug]?.latestUpload || folderMetadata[f.slug]?.created || 0);
+
+    const sorters = {
+      name_asc: (a, b) => a.title.localeCompare(b.title),
+      name_desc: (a, b) => b.title.localeCompare(a.title),
+      size_desc: (a, b) => getSizeBytes(b) - getSizeBytes(a),
+      size_asc: (a, b) => getSizeBytes(a) - getSizeBytes(b),
+      files_desc: (a, b) => getFilesCount(b) - getFilesCount(a),
+      date_desc: (a, b) => getDateTs(b) - getDateTs(a),
+    };
+
+    if (sorters[folderSortMode]) {
+      copy.sort(sorters[folderSortMode]);
+      for (const item of copy) {
+        subGrid.appendChild(item.el);
+      }
+    }
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+  }
+
+  function ensureFolderDock() {
+    if (folderDock) return folderDock;
+    folderDock = document.createElement('div');
+    folderDock.id = FOLDER_DOCK_ID;
+    folderDock.className = 'nfw-folder-dock';
+    folderDock.hidden = true;
+    folderDock.innerHTML = `
+      <div class="nfw-fd-summary">
+        <span class="nfw-fd-icon">🗂</span>
+        <div class="nfw-fd-text">
+          <strong data-role="fdCount">0 folders</strong>
+          <small data-role="fdMeta">0 files · 0 GB</small>
+        </div>
+      </div>
+      <div class="nfw-fd-actions">
+        <button type="button" class="nfw-fd-btn nfw-fd-merge" data-action="dockMerge" title="Combine selected folders into a unified list on this page">🗂 Merge on this page</button>
+        <button type="button" class="nfw-fd-btn" data-action="dockNewTab" title="Open merged folders in a new browser tab">⧉ In new tab</button>
+        <button type="button" class="nfw-fd-btn" data-action="dockZip" title="Download selected folders as ZIP archives">⬇ Download ZIP</button>
+        <button type="button" class="nfw-fd-btn" data-action="dockSave" title="Batch save selected folders to your Filester account">💾 Save to Account</button>
+        <button type="button" class="nfw-fd-close" data-action="dockClear" title="Clear selection">✕</button>
+      </div>
+    `;
+
+    document.body.appendChild(folderDock);
+
+    folderDock.addEventListener('click', (event) => {
+      const btn = event.target.closest('button');
+      if (!btn) return;
+      const act = btn.dataset.action;
+      const slugs = [...selectedFolders];
+      if (act === 'dockMerge') {
+        activateMergedFolderView(slugs, { inPlace: true });
+      } else if (act === 'dockNewTab') {
+        window.open(`${location.origin}${location.pathname}#merge=${slugs.join(',')}`, '_blank');
+      } else if (act === 'dockZip') {
+        downloadSelectedFoldersZip(slugs);
+      } else if (act === 'dockSave') {
+        saveSelectedFoldersToAccount(slugs);
+      } else if (act === 'dockClear') {
+        selectedFolders.clear();
+        refreshSubfolders();
+      }
+    });
+
+    return folderDock;
+  }
+
+  function syncFolderDock() {
+    const dock = ensureFolderDock();
+    if (!dock) return;
+
+    if (selectedFolders.size === 0 || isMergedMode) {
+      dock.hidden = true;
+      return;
+    }
+
+    dock.hidden = false;
+    const countEl = dock.querySelector('[data-role="fdCount"]');
+    const metaEl = dock.querySelector('[data-role="fdMeta"]');
+
+    let totalFiles = 0;
+    let totalBytes = 0;
+    for (const slug of selectedFolders) {
+      const item = folderItems.find((f) => f.slug === slug);
+      const meta = folderMetadata[slug] || {};
+      totalFiles += Number(meta.filesCount || item?.nativeFilesCount || 0);
+      totalBytes += Number(meta.sizeBytes || 0);
+    }
+
+    if (countEl) countEl.textContent = `${selectedFolders.size} folder${selectedFolders.size === 1 ? '' : 's'} selected`;
+    if (metaEl) {
+      const sizeStr = totalBytes > 0 ? ` · ${formatBytes(totalBytes)}` : '';
+      metaEl.textContent = `${totalFiles} file${totalFiles === 1 ? '' : 's'}${sizeStr}`;
+    }
+  }
+
+  async function activateMergedFolderView(slugs, { inPlace = true } = {}) {
+    if (!slugs.length) return;
+    grid = findFileGrid() || grid;
+    if (!grid) {
+      toast('Could not find target files grid for merged album.', true);
+      return;
+    }
+
+    isMergedMode = true;
+    activeMergedFolderFilter = 'all';
+    syncFolderDock();
+
+    // Backup original files and subfolders display
+    if (originalFilesGridBackup == null) {
+      originalFilesGridBackup = grid.innerHTML;
+    }
+    const subSection = document.querySelector('#subfoldersGrid, .subfolders-grid')?.closest('section');
+    if (subSection && !originalSubfoldersSectionDisplay) {
+      originalSubfoldersSectionDisplay = subSection.style.display || '';
+      subSection.style.display = 'none';
+    }
+    document.querySelectorAll('.files-section .pagination, main .pagination').forEach((el) => {
+      el.classList.add('nfw-orig-pagination-hidden');
+    });
+
+    // Update URL hash
+    if (inPlace) {
+      try {
+        history.replaceState(null, '', `${location.pathname}${location.search}#merge=${slugs.join(',')}`);
+      } catch (_) {}
+    }
+
+    // Prepare banner
+    ensureMergedBanner(slugs);
+
+    // Show loading state
+    grid.innerHTML = `
+      <div class="nfw-merged-loading">
+        <div class="nfw-merged-spinner"></div>
+        <p>Loading files from ${slugs.length} selected folders…</p>
+      </div>
+    `;
+
+    setMergedProgress(10, `Preparing folders (0/${slugs.length})…`);
+
+    mergedFoldersInfo = [];
+    const loadedCards = [];
+    let processed = 0;
+
+    await mapWithLimit(slugs, 3, async (slug) => {
+      const existingFolder = folderItems.find((f) => f.slug === slug);
+      let folderTitle = existingFolder?.title || '';
+      let totalPages = 1;
+
+      try {
+        const resp = await fetch(`/f/${slug}`, { credentials: 'same-origin' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const html = await resp.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+
+        if (!folderTitle) {
+          folderTitle = doc.querySelector('h1')?.textContent?.trim() || slug;
+        }
+
+        const totalPagesAttr = doc.querySelector('#loadAllPagesBtn')?.getAttribute('data-total');
+        if (totalPagesAttr) totalPages = parseInt(totalPagesAttr, 10) || 1;
+
+        const fileItems = [...doc.querySelectorAll('#filesGrid .file-item, .files-list .file-item')];
+
+        for (const item of fileItems) {
+          item.dataset.folderSlug = slug;
+          item.dataset.folderName = folderTitle;
+
+          // Inject origin badge into file-info
+          const info = item.querySelector('.file-info');
+          if (info && !item.querySelector('.nfw-origin-badge')) {
+            const originBadge = document.createElement('span');
+            originBadge.className = 'nfw-origin-badge';
+            originBadge.title = `Source folder: ${folderTitle}`;
+            originBadge.textContent = `📁 ${folderTitle}`;
+            info.appendChild(originBadge);
+          }
+
+          loadedCards.push(item);
+        }
+
+        // If there are multiple pages, automatically load all pages for this folder
+        if (totalPages > 1) {
+          for (let p = 2; p <= totalPages; p++) {
+            setMergedProgress(
+              Math.min(95, Math.round(((processed + (p / totalPages)) / slugs.length) * 85)),
+              `Loading ${folderTitle} (${p}/${totalPages} pages)…`
+            );
+            try {
+              const pResp = await fetch(`/f/${slug}?page=${p}`, { credentials: 'same-origin' });
+              if (pResp.ok) {
+                const pHtml = await pResp.text();
+                const pDoc = new DOMParser().parseFromString(pHtml, 'text/html');
+                const pItems = [...pDoc.querySelectorAll('#filesGrid .file-item, .files-list .file-item')];
+                for (const item of pItems) {
+                  item.dataset.folderSlug = slug;
+                  item.dataset.folderName = folderTitle;
+                  const info = item.querySelector('.file-info');
+                  if (info && !item.querySelector('.nfw-origin-badge')) {
+                    const originBadge = document.createElement('span');
+                    originBadge.className = 'nfw-origin-badge';
+                    originBadge.title = `Source folder: ${folderTitle}`;
+                    originBadge.textContent = `📁 ${folderTitle}`;
+                    info.appendChild(originBadge);
+                  }
+                  loadedCards.push(item);
+                }
+              }
+            } catch (pErr) {
+              console.warn('[Filester Workspace] Error loading page', p, 'for folder', slug, pErr);
+            }
+          }
+        }
+
+        const totalLoadedForFolder = loadedCards.filter((c) => c.dataset.folderSlug === slug).length;
+        mergedFoldersInfo.push({
+          slug,
+          title: folderTitle,
+          count: totalLoadedForFolder,
+          totalPages,
+          loadedPages: totalPages,
+        });
+      } catch (err) {
+        console.warn('[Filester Workspace] Merged view failed loading slug:', slug, err);
+        mergedFoldersInfo.push({ slug, title: folderTitle || slug, count: 0, totalPages: 1, loadedPages: 1 });
+      } finally {
+        processed += 1;
+        setMergedProgress(Math.round((processed / slugs.length) * 80), `Loaded ${processed}/${slugs.length} folders`);
+      }
+    });
+
+    grid.innerHTML = '';
+    for (const card of loadedCards) {
+      grid.appendChild(card);
+    }
+
+    setMergedProgress(null);
+    refresh();
+    updateMergedBannerChips();
+    toast(`Merged ${loadedCards.length} files from ${slugs.length} folders.`);
+  }
+
+  function ensureMergedBanner(slugs) {
+    let banner = document.getElementById(MERGED_BANNER_ID);
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = MERGED_BANNER_ID;
+      banner.className = 'nfw-merged-banner';
+      banner.innerHTML = `
+        <div class="nfw-mb-top">
+          <div class="nfw-mb-title-wrap">
+            <span class="nfw-mb-icon">🗂</span>
+            <strong>Merged Album</strong>
+            <span class="nfw-mb-pill" data-role="mbPill">${slugs.length} folders</span>
+            <span class="nfw-mb-stats" data-role="mbStats">Preparing…</span>
+          </div>
+          <div class="nfw-mb-actions">
+            <button type="button" class="nfw-mb-btn" data-action="mergedLoadAllPages" title="Load remaining pages for all merged folders">Load all pages</button>
+            <button type="button" class="nfw-mb-btn" data-action="mergedNewTab" title="Open this merged view in a new tab">⧉ In new tab</button>
+            <button type="button" class="nfw-mb-btn nfw-mb-close" data-action="mergedExit" title="Return to original album">← Back to folders</button>
+          </div>
+        </div>
+        <div class="nfw-mb-chips" data-role="mbChips"></div>
+        <div class="nfw-progress" data-role="mbProgress" hidden><i></i><span></span></div>
+      `;
+
+      grid.parentElement.insertBefore(banner, grid);
+
+      banner.addEventListener('click', (event) => {
+        const btn = event.target.closest('button');
+        if (btn) {
+          const act = btn.dataset.action;
+          if (act === 'mergedExit') exitMergedFolderView();
+          else if (act === 'mergedNewTab') {
+            const currentSlugs = mergedFoldersInfo.map((f) => f.slug);
+            window.open(`${location.origin}${location.pathname}#merge=${currentSlugs.join(',')}`, '_blank');
+          } else if (act === 'mergedLoadAllPages') {
+            loadAllMergedPages();
+          }
+          return;
+        }
+
+        const chip = event.target.closest('.nfw-folder-chip');
+        if (chip) {
+          const filterSlug = chip.dataset.filterSlug || 'all';
+          activeMergedFolderFilter = filterSlug;
+          updateMergedBannerChips();
+          applySortAndFilters();
+        }
+      });
+    }
+
+    return banner;
+  }
+
+  function updateMergedBannerChips() {
+    const banner = document.getElementById(MERGED_BANNER_ID);
+    if (!banner) return;
+
+    const pill = banner.querySelector('[data-role="mbPill"]');
+    if (pill) pill.textContent = `${mergedFoldersInfo.length} folders`;
+
+    const stats = banner.querySelector('[data-role="mbStats"]');
+    if (stats) {
+      const totalFiles = items.length;
+      let totalBytes = 0;
+      for (const it of items) totalBytes += Number(it.sizeBytes || 0);
+      stats.textContent = `${totalFiles} files · ${formatBytes(totalBytes)}`;
+    }
+
+    const chipsWrap = banner.querySelector('[data-role="mbChips"]');
+    if (chipsWrap) {
+      const totalCount = items.length;
+      let html = `<span class="nfw-folder-chip ${activeMergedFolderFilter === 'all' ? 'is-active' : ''}" data-filter-slug="all">All files (${totalCount})</span>`;
+      for (const info of mergedFoldersInfo) {
+        const count = items.filter((it) => (it.folderSlug || it.el.dataset.folderSlug) === info.slug).length;
+        const isActive = activeMergedFolderFilter === info.slug ? 'is-active' : '';
+        html += `<span class="nfw-folder-chip ${isActive}" data-filter-slug="${escapeHtml(info.slug)}">📁 ${escapeHtml(info.title)} (${count})</span>`;
+      }
+      chipsWrap.innerHTML = html;
+    }
+  }
+
+  async function loadAllMergedPages() {
+    const banner = document.getElementById(MERGED_BANNER_ID);
+    const loadAllBtn = banner?.querySelector('[data-action="mergedLoadAllPages"]');
+    if (loadAllBtn) loadAllBtn.disabled = true;
+
+    const targets = mergedFoldersInfo.filter((f) => f.totalPages > f.loadedPages);
+    if (!targets.length) {
+      toast('All pages of selected folders are already loaded.');
+      if (loadAllBtn) loadAllBtn.disabled = false;
+      return;
+    }
+
+    toast(`Loading additional pages for ${targets.length} folders…`);
+    let addedFiles = 0;
+
+    for (const folder of targets) {
+      for (let p = folder.loadedPages + 1; p <= folder.totalPages; p++) {
+        setMergedProgress(50, `Loading ${folder.title} (page ${p}/${folder.totalPages})…`);
+        try {
+          const resp = await fetch(`/f/${folder.slug}?page=${p}`, { credentials: 'same-origin' });
+          if (!resp.ok) continue;
+          const html = await resp.text();
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          const fileItems = [...doc.querySelectorAll('#filesGrid .file-item, .files-list .file-item')];
+
+          for (const item of fileItems) {
+            item.dataset.folderSlug = folder.slug;
+            item.dataset.folderName = folder.title;
+            const info = item.querySelector('.file-info');
+            if (info && !item.querySelector('.nfw-origin-badge')) {
+              const originBadge = document.createElement('span');
+              originBadge.className = 'nfw-origin-badge';
+              originBadge.title = `Source folder: ${folder.title}`;
+              originBadge.textContent = `📁 ${folder.title}`;
+              info.appendChild(originBadge);
+            }
+            grid.appendChild(item);
+            addedFiles += 1;
+          }
+          folder.loadedPages = p;
+        } catch (err) {
+          console.warn('[Filester Workspace] Error loading page', p, 'for folder', folder.slug, err);
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+
+    setMergedProgress(null);
+    if (loadAllBtn) loadAllBtn.disabled = false;
+    refresh();
+    updateMergedBannerChips();
+    toast(`Finished loading: added ${addedFiles} files.`);
+  }
+
+  function setMergedProgress(percent, text = '') {
+    const banner = document.getElementById(MERGED_BANNER_ID);
+    const row = banner?.querySelector('[data-role="mbProgress"]');
+    if (!row) return;
+    row.hidden = percent == null;
+    if (percent != null) {
+      row.querySelector('i').style.width = `${Math.max(2, percent)}%`;
+      row.querySelector('span').textContent = text;
+    }
+  }
+
+  function exitMergedFolderView() {
+    isMergedMode = false;
+    activeMergedFolderFilter = 'all';
+
+    // Remove hash
+    try {
+      history.replaceState(null, '', `${location.pathname}${location.search}`);
+    } catch (_) {}
+
+    // Remove banner
+    document.getElementById(MERGED_BANNER_ID)?.remove();
+
+    // Restore subfolders section
+    const subSection = document.querySelector('#subfoldersGrid, .subfolders-grid')?.closest('section');
+    if (subSection) {
+      subSection.style.display = originalSubfoldersSectionDisplay || '';
+    }
+
+    // Restore pagination
+    document.querySelectorAll('.nfw-orig-pagination-hidden').forEach((el) => {
+      el.classList.remove('nfw-orig-pagination-hidden');
+    });
+
+    // Restore files grid
+    if (originalFilesGridBackup != null && grid) {
+      grid.innerHTML = originalFilesGridBackup;
+    }
+
+    refresh();
+    syncFolderDock();
+    toast('Merged view closed. Original album view restored.');
+  }
+
+  function checkMergedHashOnBoot() {
+    if (isManagerPage()) return;
+    const hash = location.hash || '';
+    const match = hash.match(/#merge=([A-Za-z0-9_,-]+)/);
+    if (match) {
+      const slugs = match[1].split(',').filter(Boolean);
+      if (slugs.length) {
+        window.setTimeout(() => {
+          activateMergedFolderView(slugs, { inPlace: true });
+        }, 300);
+      }
+    }
+  }
+
+  async function downloadSelectedFoldersZip(slugs) {
+    if (!slugs.length) return;
+    toast(`Starting ZIP download for ${slugs.length} folder${slugs.length === 1 ? '' : 's'}…`);
+
+    for (let i = 0; i < slugs.length; i++) {
+      const slug = slugs[i];
+      const folder = folderItems.find((f) => f.slug === slug);
+      const title = folder?.title || slug;
+      toast(`Generating ZIP for "${title}" (${i + 1}/${slugs.length})…`);
+
+      try {
+        const resp = await fetch('/api/folder/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: slug }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.success && data.data?.download_url) {
+          const link = document.createElement('a');
+          link.href = data.data.download_url;
+          link.download = `${title}.zip`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        } else {
+          throw new Error(data.message || `Server ${resp.status}`);
+        }
+      } catch (err) {
+        toast(`Error downloading "${title}": ${err.message}`, true);
+      }
+
+      if (i < slugs.length - 1) {
+        await new Promise((r) => setTimeout(r, 1800));
+      }
+    }
+
+    toast('ZIP download completed.');
+  }
+
+  async function saveSelectedFoldersToAccount(slugs) {
+    if (!slugs.length) return;
+    toast(`Fetching files from ${slugs.length} folder${slugs.length === 1 ? '' : 's'} to save to account…`);
+
+    const fileSlugs = [];
+    for (const slug of slugs) {
+      try {
+        const resp = await fetch(`/f/${slug}`, { credentials: 'same-origin' });
+        if (!resp.ok) continue;
+        const html = await resp.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const matches = Array.from(html.matchAll(/\/d\/([A-Za-z0-9_-]+)/g), (m) => m[1]);
+        for (const s of matches) {
+          if (!fileSlugs.includes(s)) fileSlugs.push(s);
+        }
+        const totalPagesAttr = doc.querySelector('#loadAllPagesBtn')?.getAttribute('data-total');
+        const totalPages = totalPagesAttr ? parseInt(totalPagesAttr, 10) || 1 : 1;
+        if (totalPages > 1) {
+          for (let p = 2; p <= totalPages; p++) {
+            const pResp = await fetch(`/f/${slug}?page=${p}`, { credentials: 'same-origin' });
+            if (pResp.ok) {
+              const pHtml = await pResp.text();
+              const pMatches = Array.from(pHtml.matchAll(/\/d\/([A-Za-z0-9_-]+)/g), (m) => m[1]);
+              for (const s of pMatches) {
+                if (!fileSlugs.includes(s)) fileSlugs.push(s);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[Filester Workspace] Save folders error fetching files:', slug, e);
+      }
+    }
+
+    if (!fileSlugs.length) {
+      toast('No files found to save in selected folders.', true);
+      return;
+    }
+
+    setProgress(0, `Saving ${fileSlugs.length} files to your account…`);
+    let succeeded = 0;
+    let failed = 0;
+
+    for (let i = 0; i < fileSlugs.length; i++) {
+      const s = fileSlugs[i];
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        const resp = await fetch('/api/file/save', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slug: s }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.success !== false) succeeded++;
+        else failed++;
+      } catch (_) {
+        failed++;
+      }
+      setProgress(Math.round(((i + 1) / fileSlugs.length) * 100), `Saved ${i + 1}/${fileSlugs.length}`);
+    }
+
+    setProgress(null);
+    toast(`Done: ${succeeded} files saved to account${failed > 0 ? `, ${failed} failed (make sure you are logged in)` : ''}.`, failed === fileSlugs.length);
+  }
+
   function injectStyles() {
     if (document.getElementById(STYLE_ID)) return;
     const style = document.createElement('style');
@@ -2186,6 +3089,70 @@
       .nfw-player-modal{position:fixed;inset:0;z-index:2147483645;display:grid;place-items:center;padding:4vh 3vw;background:rgba(0,0,0,.78);backdrop-filter:blur(6px)}.nfw-player-modal[hidden]{display:none!important}.nfw-player-dialog{width:min(1140px,94vw);max-height:92vh;overflow:hidden;border:1px solid #465163;border-radius:14px;background:#10141b;color:#eef2f7;box-shadow:0 24px 70px rgba(0,0,0,.7)}.nfw-player-dialog header{display:flex;align-items:center;gap:12px;min-height:48px;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.12);flex-wrap:wrap}.nfw-player-dialog header strong{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:600 13px/1.25 system-ui}.nfw-player-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.nfw-player-controls button{padding:5px 9px;border:1px solid #4b5563;border-radius:7px;background:#171d27;color:#fff;font:600 12px/1 system-ui;cursor:pointer}.nfw-player-controls button:hover{border-color:var(--nfw-accent);background:#232b3a}.nfw-player-controls button.is-on{border-color:var(--nfw-green);background:#14532d}.nfw-player-stage{position:relative;display:grid;place-items:center;min-height:min(52vw,630px);max-height:calc(92vh - 54px);background:#050608}.nfw-player-stage video{display:block;width:100%;max-height:calc(92vh - 54px);background:#000}.nfw-player-stage p{margin:18px;color:#c5cfdd;font:500 13px/1.4 system-ui;text-align:center}.nfw-player-stage .nfw-player-error{color:#fecaca}
       .nfw-help-dialog{width:min(680px,92vw)}.nfw-help-content{padding:16px 20px;line-height:1.55;font-size:13px;color:#d1d9e6;max-height:80vh;overflow-y:auto}.nfw-help-content h4{margin:14px 0 6px;color:#fff;font-size:14px}.nfw-help-content h4:first-child{margin-top:0}.nfw-help-content ul{margin:0 0 10px;padding-left:20px}.nfw-help-content li{margin-bottom:5px}.nfw-help-content kbd,.nfw-help-content code{padding:2px 6px;border-radius:5px;background:#1c222d;border:1px solid #364152;color:#a78bfa;font-size:12px}
       .nfw-split-modal{position:fixed;inset:0;z-index:2147483646;display:flex;flex-direction:column;background:#06080c;color:#edf2f7}.nfw-split-modal[hidden]{display:none!important}.nfw-split-bar{display:flex;align-items:center;gap:14px;padding:10px 16px;background:#11151e;border-bottom:1px solid #2b3342;font:13px system-ui}.nfw-split-bar span{color:#9aa6b5;font-size:12px}.nfw-split-actions{margin-left:auto;display:flex;gap:8px}.nfw-split-actions button{padding:6px 11px;border:1px solid #3b4454;border-radius:7px;background:#1a202c;color:#fff;font:600 12px system-ui;cursor:pointer}.nfw-split-actions button:hover{border-color:var(--nfw-accent);background:#2d3748}.nfw-split-grid{flex:1;display:grid;grid-template-columns:repeat(var(--nfw-split-cols,2),minmax(0,1fr));gap:8px;padding:8px;overflow:auto}.nfw-split-cell{position:relative;display:flex;flex-direction:column;background:#0d1017;border:1px solid #252d3a;border-radius:10px;overflow:hidden}.nfw-split-cell:hover{border-color:var(--nfw-accent)}.nfw-split-cell-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 10px;background:rgba(15,19,26,.9);font:600 11px system-ui;color:#cbd5e1}.nfw-split-cell-head span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nfw-split-cell-head a{color:#a78bfa;text-decoration:none;font-size:13px}.nfw-split-cell video{width:100%;height:100%;flex:1;object-fit:contain;background:#000}
+      /* Subfolders Section & Cards */
+      .subfolder-item, a[href*="/f/"].subfolder-item{position:relative!important;text-decoration:none!important}
+      .nfw-subfolder-card{transition:transform .15s,box-shadow .15s!important}
+      .nfw-subfolder-card:hover{transform:translateY(-2px)!important}
+      .nfw-subfolder-card.nfw-selected{outline:3px solid var(--nfw-accent)!important;outline-offset:-2px!important;border-radius:12px!important}
+      .nfw-folder-check-wrap{top:8px!important;left:8px!important;z-index:25!important}
+      .nfw-folder-open-btn{position:absolute!important;top:8px;right:8px;z-index:25;width:28px;height:28px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.24);border-radius:7px;background:rgba(8,10,14,.78);color:#cbd5e1;font:700 14px/1 system-ui;text-decoration:none!important;backdrop-filter:blur(6px);transition:.14s}
+      .nfw-folder-open-btn:hover{background:var(--nfw-accent);color:#fff;border-color:var(--nfw-accent)}
+      .nfw-folder-badge{display:none!important}
+      .nfw-folder-meta{display:flex!important;flex-wrap:wrap;align-items:center;gap:6px 9px;margin-top:4px!important;font-size:11px!important;line-height:1.25!important;color:var(--nfw-muted)!important}
+      .nfw-fmeta-item{display:inline-flex;align-items:center;gap:3px}
+      .nfw-fmeta-files strong{color:#e2e8f0}
+      .nfw-fmeta-pages{color:#a78bfa;font-weight:600;margin-left:2px}
+      .nfw-fmeta-size strong{color:#a5b4fc}
+      .nfw-fmeta-loading{color:#64748b;font-style:italic}
+      /* Folder management toolbar */
+      .nfw-folder-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0 14px;padding:8px 12px;border:1px solid var(--nfw-border);border-radius:10px;background:rgba(18,22,30,.92);backdrop-filter:blur(10px);font:12px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--nfw-text);flex-wrap:wrap}
+      .nfw-ft-left,.nfw-ft-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .nfw-ft-title{font-weight:700;font-size:13px;color:#fff}
+      .nfw-ft-search{position:relative;display:flex;align-items:center}
+      .nfw-ft-search span{position:absolute;left:8px;color:var(--nfw-muted);font-size:13px;pointer-events:none}
+      .nfw-ft-search input{height:28px;padding:4px 8px 4px 24px;border:1px solid var(--nfw-border);border-radius:6px;background:#0d1016;color:var(--nfw-text);font:inherit;font-size:11.5px;outline:none}
+      .nfw-folder-toolbar select{height:28px;padding:3px 8px;border:1px solid var(--nfw-border);border-radius:6px;background:#0d1016;color:var(--nfw-text);font:inherit;font-size:11.5px;outline:none}
+      .nfw-folder-toolbar button{height:28px;padding:4px 9px;border:1px solid var(--nfw-border);border-radius:6px;background:#171d27;color:var(--nfw-text);font:inherit;font-size:11.5px;cursor:pointer;transition:.12s}
+      .nfw-folder-toolbar button:hover{border-color:var(--nfw-accent);background:var(--nfw-surface2)}
+      .nfw-ft-stats{font-size:11px;color:var(--nfw-muted)}
+      /* Folder action dock (floating) */
+      .nfw-folder-dock{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:2147483620;display:flex;align-items:center;gap:14px;padding:10px 18px;border:1px solid rgba(139,92,246,.5);border-radius:14px;background:rgba(14,17,24,.94);backdrop-filter:blur(16px);box-shadow:0 16px 45px rgba(0,0,0,.6),0 0 0 1px rgba(139,92,246,.25);color:#fff;font:12.5px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;animation:nfwSlideUp .2s ease-out}
+      .nfw-folder-dock[hidden]{display:none!important}
+      @keyframes nfwSlideUp{from{transform:translate(-50%,20px);opacity:0}to{transform:translate(-50%,0);opacity:1}}
+      .nfw-fd-summary{display:flex;align-items:center;gap:10px;padding-right:12px;border-right:1px solid rgba(255,255,255,.14)}
+      .nfw-fd-icon{font-size:22px;line-height:1}
+      .nfw-fd-text{display:grid;line-height:1.25}
+      .nfw-fd-text strong{font-size:13px;color:#fff}
+      .nfw-fd-text small{color:#a5b4fc;font-size:11px}
+      .nfw-fd-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .nfw-fd-btn{height:32px;padding:6px 12px;border:1px solid var(--nfw-border);border-radius:8px;background:#1a202c;color:#edf2f7;font:600 12px system-ui;cursor:pointer;transition:.15s}
+      .nfw-fd-btn:hover{border-color:var(--nfw-accent);background:var(--nfw-surface2)}
+      .nfw-fd-btn.nfw-fd-merge{border:none!important;background:linear-gradient(90deg,#7c3aed,#9333ea)!important;color:#fff!important;font-weight:700!important;box-shadow:0 4px 14px rgba(124,58,237,.4)}
+      .nfw-fd-btn.nfw-fd-merge:hover{filter:brightness(1.15);transform:translateY(-1px)}
+      .nfw-fd-close{width:28px;height:28px;border:1px solid #475569;border-radius:7px;background:#131720;color:#94a3b8;font-size:15px;cursor:pointer;display:grid;place-items:center;margin-left:4px}
+      .nfw-fd-close:hover{color:#fff;background:#1e293b}
+      /* Virtual Merged Album Banner & Origin Badges */
+      .nfw-merged-banner{margin:10px 0 16px;padding:12px 16px;border:1px solid rgba(139,92,246,.45);border-radius:12px;background:linear-gradient(135deg,rgba(20,18,34,.96),rgba(15,23,42,.96));backdrop-filter:blur(14px);box-shadow:0 10px 30px rgba(0,0,0,.4);display:grid;gap:10px;color:#edf2f7;font:12px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif}
+      .nfw-mb-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+      .nfw-mb-title-wrap{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+      .nfw-mb-icon{font-size:20px;line-height:1}
+      .nfw-mb-title-wrap strong{font-size:14px;color:#fff}
+      .nfw-mb-pill{padding:3px 8px;border-radius:12px;background:rgba(139,92,246,.25);border:1px solid rgba(139,92,246,.4);color:#c4b5fd;font-weight:700;font-size:11px}
+      .nfw-mb-stats{color:#94a3b8;font-size:11.5px}
+      .nfw-mb-actions{display:flex;align-items:center;gap:8px}
+      .nfw-mb-actions button{height:30px;padding:5px 11px;border:1px solid var(--nfw-border);border-radius:7px;background:#171d27;color:#fff;font:600 11.5px system-ui;cursor:pointer;transition:.14s}
+      .nfw-mb-actions button:hover{border-color:var(--nfw-accent);background:var(--nfw-surface2)}
+      .nfw-mb-close{border-color:rgba(239,68,68,.4)!important;color:#fca5a5!important;background:rgba(239,68,68,.1)!important}
+      .nfw-mb-close:hover{background:rgba(239,68,68,.2)!important;border-color:#f87171!important;color:#fff!important}
+      .nfw-mb-chips{display:flex;flex-wrap:wrap;gap:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.07)}
+      .nfw-folder-chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(255,255,255,.04);color:#cbd5e1;font-size:11.5px;cursor:pointer;transition:.14s}
+      .nfw-folder-chip:hover{border-color:#a78bfa;background:rgba(139,92,246,.15);color:#fff}
+      .nfw-folder-chip.is-active{border-color:#8b5cf6;background:#6d28d9;color:#fff;font-weight:600;box-shadow:0 2px 8px rgba(109,40,217,.35)}
+      .nfw-origin-badge{display:inline-block;margin-top:4px;padding:2px 6px;border-radius:4px;background:rgba(139,92,246,.2);border:1px solid rgba(139,92,246,.35);color:#c4b5fd;font:600 10px system-ui;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .nfw-merged-loading{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:50px 20px;color:#94a3b8;font-size:13px}
+      .nfw-merged-spinner{width:34px;height:34px;border:3px solid rgba(139,92,246,.2);border-top-color:#a855f7;border-radius:50%;animation:nfwSpin .8s linear infinite}
+      @keyframes nfwSpin{to{transform:rotate(360deg)}}
+      .nfw-orig-pagination-hidden{display:none!important}
       @media(max-width:900px){body.nfw-active .nfw-shell{width:96vw!important;max-width:96vw!important}#${UTILITY_NAV_ID}{justify-content:center}#${UTILITY_NAV_ID} nav>div{justify-content:center!important;gap:8px!important}#${TOOLBAR_ID}{position:relative;top:auto}#${TOOLBAR_ID} .nfw-primary-row>*{flex:1;min-width:180px}#${TOOLBAR_ID} .nfw-help{display:none}}
       @media(max-width:600px){body.nfw-active #filesGrid.grid-view,body.nfw-active #filesGrid,body.nfw-active .files-list,body.nfw-active .nfw-manager-grid{grid-template-columns:repeat(auto-fill,minmax(min(var(--nfw-card-min),100%),1fr))!important;gap:8px!important}#${TOOLBAR_ID} .nfw-brand{min-width:0}.nfw-meta-badge span{font-size:9px;padding:3px 4px}}
     `;

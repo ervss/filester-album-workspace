@@ -1,13 +1,13 @@
 # Filester Album Workspace (Standalone Edition)
 
-[![Version](https://img.shields.io/badge/version-2.0.0-22c55e.svg)](https://github.com/ervss/filester-album-workspace)
+[![Version](https://img.shields.io/badge/version-2.1.0-22c55e.svg)](https://github.com/ervss/filester-album-workspace)
 [![Author](https://img.shields.io/badge/author-ervss-8b5cf6.svg)](https://github.com/ervss)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Install Userscript](https://img.shields.io/badge/Install-Tampermonkey%20%2F%20Violentmonkey-brightgreen?logo=tampermonkey)](https://raw.githubusercontent.com/ervss/filester-album-workspace/main/filester-album-workspace-standalone.user.js)
 
 Created by **[ervss](https://github.com/ervss)** — **Filester Album Workspace** is a self-contained power-user userscript that transforms any public Filester folder (`/f/...`) or your personal Filester File Manager (`/manager`) into a fast, responsive media curation & playback workspace.
 
-This **Standalone Edition (v2.0.0)** runs **100% in your browser**—no local server, Python backend, or companion scripts are required.
+This **Standalone Edition (v2.1.0)** runs **100% in your browser**—no local server, Python backend, or companion scripts are required.
 
 ---
 
@@ -24,6 +24,12 @@ This **Standalone Edition (v2.0.0)** runs **100% in your browser**—no local se
 
 ## ✨ Key Features
 
+- **Subfolders Discovery & Virtual Merged Albums:**
+  - **Accurate Folder Metadata:** Automatically displays true total file counts, total pages (`📄 121 files (6 pages)`), overall size (`💾 119.72 GB`), and upload/creation dates directly under each folder title (clean thumbnail without duplicate badges).
+  - **Folder Toolbar:** Removes Filester's 5-folder cap, supports real-time text filtering (`⌕ Filter folders...`), and offers 7 sort modes (Name A–Z / Z–A, Size, File Count, Newest upload).
+  - **Floating Folder Action Dock:** Select 1+ folders to see total items and size, and trigger one-click bulk actions.
+  - **Virtual Merged View:** Merge multiple folders into a unified list right on the same page. Automatically walks through and fetches **all pages** for each selected folder (handling Filester's 24-files-per-page limit). Includes interactive folder chips for instant origin filtering, direct origin badges (`📁 Folder Name`), and one-click exit back to the original folders view.
+  - **Persistent Merged Links:** Bookmark or share merged views with `#merge=slug1,slug2` URL hash.
 - **6 Responsive Widescreen Grid Layouts:** Switch instantly between `Mini`, `Compact`, `Overview`, `Large`, `Cinema`, and `Max` (Poster) 16:9 views that utilize 96% of your viewport width.
 - **Advanced Search & Boolean Filtering:**
   - Instant search across filenames with support for exact phrases (`"exact match"`) and negative exclusion tokens (`-trailer -sample`).
